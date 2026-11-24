@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import json
 import re
+import struct
 import urllib.error
 from pathlib import Path
 from typing import Any
@@ -117,6 +118,21 @@ def test_html_report_escaping_zero_cdn_and_wireframe_json(tmp_path: Path) -> Non
     assert statuses["Sword"] == "added"
     assert statuses["</script><script>alert('xss')</script>"] == "modified"
 
+    # Non-finite floats in vertex buffer must not emit literal NaN/Infinity into embedded JSON
+    b_nan = GltfSceneBuilder()
+    bv = b_nan.append_bytes(
+        struct.pack("<9f", float("nan"), 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0)
+    )
+    acc = b_nan.add_accessor(bv, 5126, 3, "VEC3")
+    b_nan.meshes.append({"name": "NanMesh", "primitives": [{"attributes": {"POSITION": acc}}]})
+    b_nan.add_node("N", mesh_idx=0, add_to_scene=True)
+    s_nan = parse_asset(b_nan.write_glb(tmp_path / "nan.glb"))
+    html_nan = generate_html_diff(diff_assets(s_nan, s_nan))
+    m_nan = re.search(r"const BEFORE_SCENE = (\{.*?\});\n", html_nan)
+    assert m_nan is not None
+    assert "NaN" not in m_nan.group(1)
+    json.loads(m_nan.group(1))
+
 
 def test_heuristic_and_mock_llm_summary(tmp_path: Path) -> None:
     old_s, new_s = _make_sample_pair(tmp_path)
@@ -175,6 +191,14 @@ def test_gemini_interactions_http_contract(
     monkeypatch.delenv("GEMINI_API_KEY", raising=False)
     with pytest.raises(LLMClientError, match="GEMINI_API_KEY"):
         generate_pr_summary(report, provider_name="gemini")
+
+    # Null steps in Gemini response raises LLMClientError rather than TypeError
+    monkeypatch.setattr(
+        "urllib.request.urlopen",
+        lambda req, timeout=30.0: _FakeHttpResponse({"steps": None}),
+    )
+    with pytest.raises(LLMClientError, match="steps"):
+        generate_pr_summary(report, provider_name="gemini", api_key="test-gem-key")
 
 
 def test_openai_ollama_http_contracts_and_error_handling(

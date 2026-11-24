@@ -90,12 +90,17 @@ class GeminiInteractionsProvider:
         }
         data = _post_json(self.endpoint, headers, payload, timeout=self.timeout)
         texts: list[str] = []
-        for step in data.get("steps", []):
-            if not isinstance(step, dict):
-                continue
-            for block in step.get("content", []):
-                if isinstance(block, dict) and isinstance(block.get("text"), str):
-                    texts.append(block["text"])
+        steps = data.get("steps")
+        if isinstance(steps, list):
+            for step in steps:
+                if not isinstance(step, dict):
+                    continue
+                content = step.get("content")
+                if not isinstance(content, list):
+                    continue
+                for block in content:
+                    if isinstance(block, dict) and isinstance(block.get("text"), str):
+                        texts.append(block["text"])
         if not texts:
             raise LLMClientError("Gemini Interactions response contained no steps[].content[].text")
         return "\n".join(texts).strip()

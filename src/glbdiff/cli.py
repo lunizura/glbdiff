@@ -236,7 +236,19 @@ def _cmd_summary(args: argparse.Namespace) -> int:
     return 0
 
 
+def _ensure_utf8_stdio() -> None:
+    for stream in (sys.stdout, sys.stderr):
+        enc = getattr(stream, "encoding", None)
+        reconfigure = getattr(stream, "reconfigure", None)
+        if callable(reconfigure) and isinstance(enc, str) and enc.lower() not in ("utf-8", "utf8"):
+            try:
+                reconfigure(encoding="utf-8", errors="replace")
+            except (OSError, ValueError):
+                pass
+
+
 def main(argv: Sequence[str] | None = None) -> int:
+    _ensure_utf8_stdio()
     parser = _build_parser()
     args = parser.parse_args(list(argv) if argv is not None else None)
     try:

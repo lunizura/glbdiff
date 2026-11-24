@@ -181,3 +181,164 @@ def test_corrupt_glb_headers_and_cyclic_nodes_rejected(tmp_path: Path) -> None:
     cyclic_glb.write_bytes(pack_glb(cyclic_doc))
     with pytest.raises(GlbParseError, match="Cyclic"):
         parse_asset(cyclic_glb)
+
+
+def test_draco_bufferless_non_indexed_fan_and_normalized_positions(tmp_path: Path) -> None:
+    # 1. Draco compressed primitive with min/max fallback and no bufferView
+    draco_doc = {
+        "asset": {"version": "2.0"},
+        "meshes": [
+            {
+                "name": "DracoMesh",
+                "primitives": [
+                    {
+                        "attributes": {"POSITION": 0, "TEXCOORD_0": 1},
+                        "indices": 2,
+                        "extensions": {
+                            "KHR_draco_mesh_compression": {
+                                "bufferView": 0,
+                                "attributes": {"POSITION": 0, "TEXCOORD_0": 1},
+                            }
+                        },
+                    }
+                ],
+            }
+        ],
+        "accessors": [
+            {
+                "componentType": 5126,
+                "count": 120,
+                "type": "VEC3",
+                "min": [-1.0, -2.0, -3.0],
+                "max": [1.0, 2.0, 3.0],
+            },
+            {"componentType": 5126, "count": 120, "type": "VEC2"},
+            {"componentType": 5123, "count": 300, "type": "SCALAR"},
+        ],
+        "nodes": [{"name": "DracoNode", "mesh": 0}],
+        "scenes": [{"nodes": [0]}],
+    }
+    p_draco = tmp_path / "draco.glb"
+    p_draco.write_bytes(pack_glb(draco_doc))
+    s_draco = parse_asset(p_draco)
+    assert s_draco.meshes[0].is_draco_compressed is True
+    assert s_draco.total_vertices == 120
+    assert s_draco.total_triangles == 100
+    assert s_draco.world_aabb is not None
+    assert s_draco.world_aabb.min_pt == (-1.0, -2.0, -3.0)
+    assert s_draco.world_aabb.max_pt == (1.0, 2.0, 3.0)
+
+    # 2. Bufferless zero-filled accessor fallback on non-Draco mesh
+    bufless_doc = {
+        "asset": {"version": "2.0"},
+        "meshes": [{"name": "ZeroMesh", "primitives": [{"attributes": {"POSITION": 0}}]}],
+        "accessors": [{"componentType": 5126, "count": 3, "type": "VEC3"}],
+        "nodes": [{"name": "N", "mesh": 0}],
+        "scenes": [{"nodes": [0]}],
+    }
+    p_bufless = tmp_path / "bufless.glb"
+    p_bufless.write_bytes(pack_glb(bufless_doc))
+    s_bufless = parse_asset(p_bufless)
+    assert s_bufless.total_vertices == 3
+    assert s_bufless.total_triangles == 1
+    assert s_bufless.world_aabb is not None
+    assert s_bufless.world_aabb.min_pt == (0.0, 0.0, 0.0)
+
+    # 3. Non-indexed TRIANGLES, TRIANGLE_FAN (mode=6), POINTS (mode=0), and normalized SHORT
+    b = GltfSceneBuilder()
+    b.add_mesh(
+        "NonIndexedTris",
+        positions=[(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0)],
+        indices=None,
+        mode=4,
+    )
+    b.add_mesh(
+        "FanMesh",
+        positions=[(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (1.0, 1.0, 0.0), (0.0, 1.0, 0.0)],
+        indices=[0, 1, 2, 3],
+        mode=6,
+    )
+    b.add_mesh("PointsMesh", positions=[(0.0, 0.0, 0.0), (1.0, 0.0, 0.0)], mode=0)
+    # Normalized SHORT VEC3
+    norm_bv = b.append_bytes(struct.pack("<3h", 32767, 0, -32767) * 3)
+    norm_acc = b.add_accessor(norm_bv, 5122, 3, "VEC3")
+    b.accessors[norm_acc]["normalized"] = True
+    b.meshes.append({"name": "QuantMesh", "primitives": [{"attributes": {"POSITION": norm_acc}}]})
+    for idx in range(4):
+        b.add_node(f"N{idx}", mesh_idx=idx, add_to_scene=True)
+
+    s_mix = parse_asset(b.write_glb(tmp_path / "mix.glb"))
+    assert s_mix.meshes[0].triangle_count == 1
+    assert s_mix.meshes[1].triangle_count == 2
+    assert s_mix.meshes[2].triangle_count == 0
+    assert s_mix.meshes[3].local_aabb is not None
+    assert math.isclose(s_mix.meshes[3].local_aabb.max_pt[0], 1.0, abs_tol=1e-4)
+    assert math.isclose(s_mix.meshes[3].local_aabb.min_pt[2], -1.0, abs_tol=1e-4)
+
+
+def test_null_json_fields_negative_lengths_drive_uri_and_multiprim_wireframe(
+    tmp_path: Path,
+) -> None:
+    # 1. Explicit null JSON fields do not crash parser
+    nulls_doc = {
+        "asset": {"version": "2.0", "generator": None},
+        "extensionsUsed": None,
+        "materials": [{"name": "M", "pbrMetallicRoughness": None, "alphaMode": None}],
+        "textures": [{"source": None, "extensions": None}],
+        "meshes": [{"name": "Mesh", "primitives": [{"attributes": None, "extensions": None}]}],
+    }
+    p_nulls = tmp_path / "nulls.glb"
+    p_nulls.write_bytes(pack_glb(nulls_doc))
+    s_nulls = parse_asset(p_nulls)
+    assert s_nulls.mesh_count == 1
+    assert s_nulls.materials[0].alpha_mode == "OPAQUE"
+
+    # 2. Negative buffer byteLength rejected
+    neg_doc = {"asset": {"version": "2.0"}, "buffers": [{"byteLength": -1}]}
+    p_neg = tmp_path / "neg.glb"
+    p_neg.write_bytes(pack_glb(neg_doc, b"\x00" * 16))
+    with pytest.raises(GlbParseError, match="Negative buffer"):
+        parse_asset(p_neg)
+
+    # 3. URL-encoded Windows drive-relative URI rejected before filesystem access
+    p_drive = tmp_path / "drive.gltf"
+    p_drive.write_text(
+        json.dumps({"asset": {"version": "2.0"}, "buffers": [{"uri": "%43:secret.bin", "byteLength": 4}]}),
+        encoding="utf-8",
+    )
+    with pytest.raises(GlbParseError, match="Unsafe external"):
+        parse_asset(p_drive)
+
+    # 4. Multi-primitive wireframe edge budget keeps edges from later primitives
+    b = GltfSceneBuilder()
+    pos0: list[tuple[float, float, float]] = []
+    idx0: list[int] = []
+    for i in range(900):
+        base = i * 3
+        pos0.extend([(0.0, 0.0, float(i)), (1.0, 0.0, float(i)), (0.0, 1.0, float(i))])
+        idx0.extend([base, base + 1, base + 2])
+    bv_p0 = b.append_bytes(b"".join(struct.pack("<fff", *p) for p in pos0))
+    bv_i0 = b.append_bytes(b"".join(struct.pack("<H", x) for x in idx0))
+    ap0 = b.add_accessor(bv_p0, 5126, len(pos0), "VEC3")
+    ai0 = b.add_accessor(bv_i0, 5123, len(idx0), "SCALAR")
+
+    pos1 = [(10.0, 10.0, 0.0), (11.0, 10.0, 0.0), (10.0, 11.0, 0.0)]
+    bv_p1 = b.append_bytes(b"".join(struct.pack("<fff", *p) for p in pos1))
+    bv_i1 = b.append_bytes(struct.pack("<HHH", 0, 1, 2))
+    ap1 = b.add_accessor(bv_p1, 5126, 3, "VEC3")
+    ai1 = b.add_accessor(bv_i1, 5123, 3, "SCALAR")
+
+    b.meshes.append(
+        {
+            "name": "MultiPrim",
+            "primitives": [
+                {"attributes": {"POSITION": ap0}, "indices": ai0},
+                {"attributes": {"POSITION": ap1}, "indices": ai1},
+            ],
+        }
+    )
+    b.add_node("N", mesh_idx=0, add_to_scene=True)
+    s_mp = parse_asset(b.write_glb(tmp_path / "multiprim.glb"), max_wireframe_edges_per_mesh=800)
+    edges = s_mp.preview.mesh_segments[0]["edges"]
+    assert len(edges) <= 800
+    assert any(e[0][0] >= 9.0 for e in edges)

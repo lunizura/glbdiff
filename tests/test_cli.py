@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -165,3 +167,22 @@ def test_cli_git_setup_print_only_and_repo_mode(
         check=True,
     )
     assert cfg.stdout.strip() == "glbdiff textconv"
+
+
+def test_cli_non_ascii_names_under_cp1252_stdout(tmp_path: Path) -> None:
+    b = GltfSceneBuilder()
+    b.add_mesh("剣_Hero", [(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0)], [0, 1, 2])
+    b.add_node("ルート", mesh_idx=0, add_to_scene=True)
+    glb_path = b.write_glb(tmp_path / "unicode.glb")
+
+    env = os.environ.copy()
+    env["PYTHONUTF8"] = "0"
+    env["PYTHONIOENCODING"] = "cp1252"
+    res = subprocess.run(
+        [sys.executable, "-m", "glbdiff.cli", "textconv", str(glb_path)],
+        capture_output=True,
+        env=env,
+        check=False,
+    )
+    assert res.returncode == 0
+    assert "剣_Hero" in res.stdout.decode("utf-8")

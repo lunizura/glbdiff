@@ -2,13 +2,18 @@ from __future__ import annotations
 
 import html
 import json
+import math
 from typing import Any
 
 from glbdiff.models import AssetSummary, DiffReport
 
 
+def _safe_float(v: float) -> float:
+    return round(v, 5) if math.isfinite(v) else 0.0
+
+
 def _safe_script_json(data: Any) -> str:
-    raw = json.dumps(data, separators=(",", ":"))
+    raw = json.dumps(data, separators=(",", ":"), allow_nan=False)
     return raw.replace("</", "<\\/").replace("<!--", "<\\!--")
 
 
@@ -46,8 +51,8 @@ def _build_scene_payload(
             status = "unchanged"
         edges = [
             [
-                [round(p0[0], 5), round(p0[1], 5), round(p0[2], 5)],
-                [round(p1[0], 5), round(p1[1], 5), round(p1[2], 5)],
+                [_safe_float(p0[0]), _safe_float(p0[1]), _safe_float(p0[2])],
+                [_safe_float(p1[0]), _safe_float(p1[1]), _safe_float(p1[2])],
             ]
             for p0, p1 in seg.get("edges", [])
         ]
@@ -55,8 +60,8 @@ def _build_scene_payload(
 
     bones_out = [
         [
-            [round(p0[0], 5), round(p0[1], 5), round(p0[2], 5)],
-            [round(p1[0], 5), round(p1[1], 5), round(p1[2], 5)],
+            [_safe_float(p0[0]), _safe_float(p0[1]), _safe_float(p0[2])],
+            [_safe_float(p1[0]), _safe_float(p1[1]), _safe_float(p1[2])],
         ]
         for p0, p1 in asset.preview.bone_segments
     ]
@@ -64,8 +69,8 @@ def _build_scene_payload(
     aabb_out = None
     if asset.preview.world_aabb is not None:
         aabb_out = {
-            "min": [round(v, 5) for v in asset.preview.world_aabb.min_pt],
-            "max": [round(v, 5) for v in asset.preview.world_aabb.max_pt],
+            "min": [_safe_float(v) for v in asset.preview.world_aabb.min_pt],
+            "max": [_safe_float(v) for v in asset.preview.world_aabb.max_pt],
         }
 
     return {
@@ -477,8 +482,8 @@ const AFTER_SCENE = {after_json};
     const y2 = cy * cp - z1 * sp;
     const z2 = cy * sp + z1 * cp;
 
-    const dist = bounds.radius * 3.0 / Math.max(cam.zoom, 0.15);
-    const denom = Math.max(dist - z2, bounds.radius * 0.25);
+    const dist = bounds.radius * 3.2;
+    const denom = Math.max(dist - z2, bounds.radius * 0.5);
     const scale = (Math.min(w, h) * 0.85 * cam.zoom) / (bounds.radius * 2.2);
     const persp = dist / denom;
     return [w * 0.5 + x1 * scale * persp, h * 0.5 - y2 * scale * persp];

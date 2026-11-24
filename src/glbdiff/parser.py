@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import json
+import math
 import struct
 import urllib.parse
 from pathlib import Path
@@ -54,12 +55,20 @@ _TYPE_COUNTS: dict[str, int] = {
 }
 
 
+def _as_dict(val: Any) -> dict[str, Any]:
+    return val if isinstance(val, dict) else {}
+
+
+def _as_list(val: Any) -> list[Any]:
+    return val if isinstance(val, list) else []
+
+
 def _disambiguate_names(items: list[dict[str, Any]], kind: str) -> list[str]:
     counts: dict[str, int] = {}
     used: set[str] = set()
     names: list[str] = []
     for idx, item in enumerate(items):
-        raw = item.get("name")
+        raw = item.get("name") if isinstance(item, dict) else None
         base = raw.strip() if isinstance(raw, str) and raw.strip() else f"<unnamed_{kind}_{idx}>"
         occ = counts.get(base, 0)
         counts[base] = occ + 1
@@ -84,15 +93,24 @@ def _decode_data_uri(uri: str) -> bytes:
 
 
 def _resolve_external_uri(base_dir: Path, uri: str) -> bytes:
+    if not uri or not uri.strip():
+        raise GlbParseError("Empty external resource URI")
     parsed = urllib.parse.urlsplit(uri)
     if parsed.scheme or uri.startswith("/") or uri.startswith("\\"):
         raise GlbParseError(f"Unsafe external buffer URI scheme or absolute path: {uri}")
     rel_uri = urllib.parse.unquote(uri)
-    if Path(rel_uri).is_absolute() or rel_uri.startswith("/") or rel_uri.startswith("\\"):
+    rel_path = Path(rel_uri)
+    if (
+        not rel_uri.strip()
+        or rel_path.is_absolute()
+        or bool(rel_path.drive)
+        or rel_uri.startswith("/")
+        or rel_uri.startswith("\\")
+    ):
         raise GlbParseError(f"Unsafe external buffer URI traversal: {uri}")
     resolved_base = base_dir.resolve()
     target = (resolved_base / rel_uri).resolve()
-    if not target.is_relative_to(resolved_base):
+    if target == resolved_base or not target.is_relative_to(resolved_base):
         raise GlbParseError(f"Unsafe external buffer URI traversal: {uri}")
     try:
         return target.read_bytes()
@@ -119,10 +137,10 @@ def _read_accessor(
     buffers: list[bytes],
     acc_idx: int,
 ) -> list[tuple[float | int, ...]]:
-    accessors = doc.get("accessors", [])
+    accessors = _as_list(doc.get("accessors"))
     if not (0 <= acc_idx < len(accessors)):
         raise GlbParseError(f"Accessor index out of range: {acc_idx}")
-    acc = accessors[acc_idx]
+    acc = _as_dict(accessors[acc_idx])
     comp_type = acc.get("componentType")
     if comp_type not in _COMP_FORMATS:
         raise GlbParseError(f"Unsupported accessor componentType: {comp_type}")
@@ -140,12 +158,12 @@ def _read_accessor(
         zero: float | int = 0.0 if comp_type == 5126 or acc.get("normalized") else 0
         return [(zero,) * n_comps for _ in range(count)]
 
-    buffer_views = doc.get("bufferViews", [])
-    if not (0 <= bv_idx < len(buffer_views)):
+    buffer_views = _as_list(doc.get("bufferViews"))
+    if isinstance(bv_idx, bool) or not isinstance(bv_idx, int) or not (0 <= bv_idx < len(buffer_views)):
         raise GlbParseError(f"bufferView index out of range: {bv_idx}")
-    bv = buffer_views[bv_idx]
+    bv = _as_dict(buffer_views[bv_idx])
     buf_idx = bv.get("buffer")
-    if not isinstance(buf_idx, int) or not (0 <= buf_idx < len(buffers)):
+    if isinstance(buf_idx, bool) or not isinstance(buf_idx, int) or not (0 <= buf_idx < len(buffers)):
         raise GlbParseError(f"buffer index out of range: {buf_idx}")
     buf = buffers[buf_idx]
 
@@ -189,6 +207,59 @@ def _triangle_indices_for_mode(idx_list: list[int], mode: int) -> list[tuple[int
         for k in range(1, len(idx_list) - 1):
             tris.append((idx_list[0], idx_list[k], idx_list[k + 1]))
     return tris
+
+
+def _sample_mesh_edges(
+    prim_edge_lists: list[list[tuple[Vec3, Vec3]]],
+    budget: int,
+) -> list[tuple[Vec3, Vec3]]:
+    if budget <= 0:
+        return []
+    non_empty = [edges for edges in prim_edge_lists if edges]
+    if not non_empty:
+        return []
+    total = sum(len(edges) for edges in non_empty)
+    if total <= budget:
+        out: list[tuple[Vec3, Vec3]] = []
+        for edges in non_empty:
+            out.extend(edges)
+        return out
+
+    n_prims = len(non_empty)
+    out = []
+    if budget <= n_prims:
+        for i in range(budget):
+            out.append(non_empty[i][0])
+        return out
+
+    alloc = [1] * n_prims
+    rem = budget - n_prims
+    caps = [len(edges) - 1 for edges in non_empty]
+    total_cap = sum(caps)
+    if total_cap > 0 and rem > 0:
+        extra = [min(caps[i], (rem * caps[i]) // total_cap) for i in range(n_prims)]
+        for i in range(n_prims):
+            alloc[i] += extra[i]
+        leftover = budget - sum(alloc)
+        for i in range(n_prims):
+            if leftover <= 0:
+                break
+            room = len(non_empty[i]) - alloc[i]
+            if room > 0:
+                take = min(room, leftover)
+                alloc[i] += take
+                leftover -= take
+
+    for edges, quota in zip(non_empty, alloc):
+        if quota >= len(edges):
+            out.extend(edges)
+        elif quota == 1:
+            out.append(edges[0])
+        else:
+            step = (len(edges) - 1) / (quota - 1)
+            for k in range(quota):
+                out.append(edges[round(k * step)])
+    return out
 
 
 def _node_local_matrix(node: dict[str, Any]) -> tuple[float, ...]:
@@ -280,13 +351,16 @@ def parse_asset(path: str | Path, max_wireframe_edges_per_mesh: int = 800) -> As
     if not gltf_version.startswith("2."):
         raise GlbParseError(f"Unsupported glTF version: {gltf_version!r}")
 
-    generator = str(asset_obj.get("generator", "unknown"))
-    extensions_used = sorted(str(x) for x in doc.get("extensionsUsed", []))
+    generator = str(asset_obj.get("generator") or "unknown")
+    extensions_used = sorted(str(x) for x in _as_list(doc.get("extensionsUsed")))
 
     base_dir = p.parent.resolve()
     buffers: list[bytes] = []
-    for idx, buf_def in enumerate(doc.get("buffers", [])):
+    for idx, raw_buf_def in enumerate(_as_list(doc.get("buffers"))):
+        buf_def = _as_dict(raw_buf_def)
         byte_len = int(buf_def.get("byteLength", 0))
+        if byte_len < 0:
+            raise GlbParseError(f"Negative buffer byteLength at index {idx}: {byte_len}")
         uri = buf_def.get("uri")
         if uri is None:
             if idx == 0 and container_format == "glb":
@@ -308,12 +382,13 @@ def parse_asset(path: str | Path, max_wireframe_edges_per_mesh: int = 800) -> As
         else:
             raise GlbParseError(f"Invalid buffer URI type at index {idx}")
 
-    materials_raw = doc.get("materials", [])
+    materials_raw = [_as_dict(m) for m in _as_list(doc.get("materials"))]
     material_names = _disambiguate_names(materials_raw, "material")
     materials: list[MaterialSummary] = []
     for m_idx, mat_def in enumerate(materials_raw):
-        pbr = mat_def.get("pbrMetallicRoughness", {})
-        bc = pbr.get("baseColorFactor", [1.0, 1.0, 1.0, 1.0])
+        pbr = _as_dict(mat_def.get("pbrMetallicRoughness"))
+        bc_raw = pbr.get("baseColorFactor")
+        bc = bc_raw if isinstance(bc_raw, list) else [1.0, 1.0, 1.0, 1.0]
         base_color = (
             float(bc[0]) if len(bc) > 0 else 1.0,
             float(bc[1]) if len(bc) > 1 else 1.0,
@@ -333,33 +408,37 @@ def parse_asset(path: str | Path, max_wireframe_edges_per_mesh: int = 800) -> As
         materials.append(
             MaterialSummary(
                 name=material_names[m_idx],
-                alpha_mode=str(mat_def.get("alphaMode", "OPAQUE")),
+                alpha_mode=str(mat_def.get("alphaMode") or "OPAQUE"),
                 double_sided=bool(mat_def.get("doubleSided", False)),
-                metallic_factor=float(pbr.get("metallicFactor", 1.0)),
-                roughness_factor=float(pbr.get("roughnessFactor", 1.0)),
+                metallic_factor=float(
+                    1.0 if pbr.get("metallicFactor") is None else pbr.get("metallicFactor")
+                ),
+                roughness_factor=float(
+                    1.0 if pbr.get("roughnessFactor") is None else pbr.get("roughnessFactor")
+                ),
                 base_color=base_color,
                 texture_count=len(tex_refs),
             )
         )
 
-    images_raw = doc.get("images", [])
-    textures_raw = doc.get("textures", [])
-    buffer_views = doc.get("bufferViews", [])
+    images_raw = [_as_dict(im) for im in _as_list(doc.get("images"))]
+    textures_raw = [_as_dict(tx) for tx in _as_list(doc.get("textures"))]
+    buffer_views = [_as_dict(bv) for bv in _as_list(doc.get("bufferViews"))]
 
     def _load_image_bytes(img_def: dict[str, Any]) -> tuple[bytes, str | None]:
         declared_mime = img_def.get("mimeType")
         bv_idx = img_def.get("bufferView")
         if bv_idx is not None:
-            if not (0 <= bv_idx < len(buffer_views)):
+            if not isinstance(bv_idx, int) or not (0 <= bv_idx < len(buffer_views)):
                 raise GlbParseError(f"Image bufferView out of range: {bv_idx}")
             bv = buffer_views[bv_idx]
-            buf_idx = int(bv["buffer"])
-            if not (0 <= buf_idx < len(buffers)):
+            buf_idx = bv.get("buffer")
+            if not isinstance(buf_idx, int) or not (0 <= buf_idx < len(buffers)):
                 raise GlbParseError(f"Image buffer index out of range: {buf_idx}")
             off = int(bv.get("byteOffset", 0))
             length = int(bv.get("byteLength", 0))
             buf = buffers[buf_idx]
-            if off < 0 or off + length > len(buf):
+            if off < 0 or length < 0 or off + length > len(buf):
                 raise GlbParseError("Image bufferView exceeds buffer bounds")
             return buf[off : off + length], declared_mime
         uri = img_def.get("uri")
@@ -376,7 +455,7 @@ def parse_asset(path: str | Path, max_wireframe_edges_per_mesh: int = 800) -> As
         for t_idx, tex_def in enumerate(textures_raw):
             src_idx = tex_def.get("source")
             if src_idx is None:
-                ktx_ext = tex_def.get("extensions", {}).get("KHR_texture_basisu", {})
+                ktx_ext = _as_dict(_as_dict(tex_def.get("extensions")).get("KHR_texture_basisu"))
                 src_idx = ktx_ext.get("source")
             if isinstance(src_idx, int) and 0 <= src_idx < len(images_raw):
                 img_def = images_raw[src_idx]
@@ -430,7 +509,7 @@ def parse_asset(path: str | Path, max_wireframe_edges_per_mesh: int = 800) -> As
             )
     total_texture_bytes = sum(seen_image_bytes.values())
 
-    meshes_raw = doc.get("meshes", [])
+    meshes_raw = [_as_dict(m) for m in _as_list(doc.get("meshes"))]
     mesh_names = _disambiguate_names(meshes_raw, "mesh")
     meshes: list[MeshSummary] = []
     mesh_local_edges_map: dict[int, list[tuple[Vec3, Vec3]]] = {}
@@ -438,9 +517,9 @@ def parse_asset(path: str | Path, max_wireframe_edges_per_mesh: int = 800) -> As
     total_vertices = 0
     total_triangles = 0
 
-    accessors = doc.get("accessors", [])
+    accessors = [_as_dict(a) for a in _as_list(doc.get("accessors"))]
     for m_idx, mesh_def in enumerate(meshes_raw):
-        primitives = mesh_def.get("primitives", [])
+        primitives = [_as_dict(pr) for pr in _as_list(mesh_def.get("primitives"))]
         m_verts = 0
         m_tris = 0
         attr_set: set[str] = set()
@@ -448,16 +527,15 @@ def parse_asset(path: str | Path, max_wireframe_edges_per_mesh: int = 800) -> As
         morph_count = 0
         is_draco = False
         prim_aabbs: list[AABB] = []
-        edge_set: set[tuple[int, int]] = set()
-        local_edges: list[tuple[Vec3, Vec3]] = []
+        prim_edge_lists: list[list[tuple[Vec3, Vec3]]] = []
 
         for prim in primitives:
-            attrs = prim.get("attributes", {})
+            attrs = _as_dict(prim.get("attributes"))
             attr_set.update(str(k) for k in attrs.keys())
-            targets = prim.get("targets", [])
+            targets = prim.get("targets")
             if isinstance(targets, list):
                 morph_count = max(morph_count, len(targets))
-            prim_exts = prim.get("extensions", {})
+            prim_exts = _as_dict(prim.get("extensions"))
             prim_draco = "KHR_draco_mesh_compression" in prim_exts
             if prim_draco:
                 is_draco = True
@@ -476,14 +554,21 @@ def parse_asset(path: str | Path, max_wireframe_edges_per_mesh: int = 800) -> As
                     raise GlbParseError(f"POSITION accessor out of range: {pos_idx}")
                 pos_acc = accessors[pos_idx]
                 prim_vcount = int(pos_acc.get("count", 0))
+                if prim_vcount < 0:
+                    raise GlbParseError(f"Negative POSITION accessor count: {prim_vcount}")
                 m_verts += prim_vcount
-                if not prim_draco and pos_acc.get("bufferView") is not None:
+                if not prim_draco:
                     raw_pos = _read_accessor(doc, buffers, pos_idx)
                     positions = [(float(v[0]), float(v[1]), float(v[2])) for v in raw_pos]
-                if positions:
-                    xs = [p0[0] for p0 in positions]
-                    ys = [p0[1] for p0 in positions]
-                    zs = [p0[2] for p0 in positions]
+                finite_pos = [
+                    p0
+                    for p0 in positions
+                    if math.isfinite(p0[0]) and math.isfinite(p0[1]) and math.isfinite(p0[2])
+                ]
+                if finite_pos:
+                    xs = [p0[0] for p0 in finite_pos]
+                    ys = [p0[1] for p0 in finite_pos]
+                    zs = [p0[2] for p0 in finite_pos]
                     prim_aabbs.append(
                         AABB(
                             min_pt=(min(xs), min(ys), min(zs)),
@@ -498,14 +583,13 @@ def parse_asset(path: str | Path, max_wireframe_edges_per_mesh: int = 800) -> As
                 ):
                     mn = pos_acc["min"]
                     mx = pos_acc["max"]
-                    prim_aabbs.append(
-                        AABB(
-                            min_pt=(float(mn[0]), float(mn[1]), float(mn[2])),
-                            max_pt=(float(mx[0]), float(mx[1]), float(mx[2])),
-                        )
-                    )
+                    mn_t = (float(mn[0]), float(mn[1]), float(mn[2]))
+                    mx_t = (float(mx[0]), float(mx[1]), float(mx[2]))
+                    if all(math.isfinite(c) for c in mn_t + mx_t):
+                        prim_aabbs.append(AABB(min_pt=mn_t, max_pt=mx_t))
 
-            mode = int(prim.get("mode", 4))
+            mode_raw = prim.get("mode", 4)
+            mode = 4 if mode_raw is None else int(mode_raw)
             indices_idx = prim.get("indices")
             idx_list: list[int] = []
             if isinstance(indices_idx, int):
@@ -513,7 +597,9 @@ def parse_asset(path: str | Path, max_wireframe_edges_per_mesh: int = 800) -> As
                     raise GlbParseError(f"Indices accessor out of range: {indices_idx}")
                 idx_acc = accessors[indices_idx]
                 elem_count = int(idx_acc.get("count", 0))
-                if not prim_draco and idx_acc.get("bufferView") is not None:
+                if elem_count < 0:
+                    raise GlbParseError(f"Negative indices accessor count: {elem_count}")
+                if not prim_draco:
                     idx_list = [int(v[0]) for v in _read_accessor(doc, buffers, indices_idx)]
             else:
                 elem_count = prim_vcount
@@ -525,9 +611,13 @@ def parse_asset(path: str | Path, max_wireframe_edges_per_mesh: int = 800) -> As
             elif mode in (5, 6):
                 m_tris += max(0, elem_count - 2)
 
-            if positions and idx_list and len(local_edges) < max_wireframe_edges_per_mesh:
-                edge_set.clear()
+            if positions and idx_list and max_wireframe_edges_per_mesh > 0:
+                edge_set: set[tuple[int, int]] = set()
+                prim_edges: list[tuple[Vec3, Vec3]] = []
                 tris = _triangle_indices_for_mode(idx_list, mode)
+                if len(tris) > max_wireframe_edges_per_mesh * 2:
+                    step = (len(tris) - 1) / (max_wireframe_edges_per_mesh * 2 - 1)
+                    tris = [tris[round(k * step)] for k in range(max_wireframe_edges_per_mesh * 2)]
                 n_pos = len(positions)
                 for a, b, c in tris:
                     if not (0 <= a < n_pos and 0 <= b < n_pos and 0 <= c < n_pos):
@@ -536,12 +626,12 @@ def parse_asset(path: str | Path, max_wireframe_edges_per_mesh: int = 800) -> As
                         key = (u, v) if u < v else (v, u)
                         if key not in edge_set:
                             edge_set.add(key)
-                            local_edges.append((positions[u], positions[v]))
-                            if len(local_edges) >= max_wireframe_edges_per_mesh:
-                                break
-                    if len(local_edges) >= max_wireframe_edges_per_mesh:
-                        break
+                            pu, pv = positions[u], positions[v]
+                            if all(math.isfinite(coord) for coord in pu + pv):
+                                prim_edges.append((pu, pv))
+                prim_edge_lists.append(prim_edges)
 
+        local_edges = _sample_mesh_edges(prim_edge_lists, max_wireframe_edges_per_mesh)
         local_aabb = merge_aabbs(prim_aabbs)
         mesh_local_edges_map[m_idx] = local_edges
         total_primitives += len(primitives)
@@ -561,23 +651,23 @@ def parse_asset(path: str | Path, max_wireframe_edges_per_mesh: int = 800) -> As
             )
         )
 
-    nodes_raw = doc.get("nodes", [])
+    nodes_raw = [_as_dict(n) for n in _as_list(doc.get("nodes"))]
     node_names = _disambiguate_names(nodes_raw, "node")
     parent_of: dict[int, int] = {}
     for n_idx, node_def in enumerate(nodes_raw):
-        for ch_idx in node_def.get("children", []):
+        for ch_idx in _as_list(node_def.get("children")):
             if not isinstance(ch_idx, int) or not (0 <= ch_idx < len(nodes_raw)):
                 raise GlbParseError(f"Child node index out of range: {ch_idx}")
             if ch_idx in parent_of:
                 raise GlbParseError(f"Node {ch_idx} has multiple parents")
             parent_of[ch_idx] = n_idx
 
-    scenes_raw = doc.get("scenes", [])
+    scenes_raw = [_as_dict(s) for s in _as_list(doc.get("scenes"))]
     if scenes_raw:
-        scene_idx = int(doc.get("scene", 0))
+        scene_idx = int(0 if doc.get("scene") is None else doc.get("scene"))
         if not (0 <= scene_idx < len(scenes_raw)):
             raise GlbParseError(f"Default scene index out of range: {scene_idx}")
-        scene_roots = [int(n) for n in scenes_raw[scene_idx].get("nodes", [])]
+        scene_roots = [int(n) for n in _as_list(scenes_raw[scene_idx].get("nodes"))]
     else:
         scene_roots = [i for i in range(len(nodes_raw)) if i not in parent_of]
 
@@ -614,7 +704,7 @@ def parse_asset(path: str | Path, max_wireframe_edges_per_mesh: int = 800) -> As
                 ]
                 mesh_segments.append({"name": m_summary.name, "edges": world_edges})
 
-        for ch_idx in node_def.get("children", []):
+        for ch_idx in _as_list(node_def.get("children")):
             _visit(ch_idx, world_mat, stack, in_scene)
 
         stack.remove(node_idx)
@@ -632,12 +722,12 @@ def parse_asset(path: str | Path, max_wireframe_edges_per_mesh: int = 800) -> As
 
     world_aabb = merge_aabbs(world_aabbs)
 
-    skins_raw = doc.get("skins", [])
+    skins_raw = [_as_dict(s) for s in _as_list(doc.get("skins"))]
     skin_names = _disambiguate_names(skins_raw, "skin")
     skins: list[SkinSummary] = []
     bone_segments: list[tuple[Vec3, Vec3]] = []
     for s_idx, skin_def in enumerate(skins_raw):
-        joint_indices = [int(j) for j in skin_def.get("joints", [])]
+        joint_indices = [int(j) for j in _as_list(skin_def.get("joints"))]
         joint_set = set(joint_indices)
         joints: list[JointInfo] = []
         for j_idx in joint_indices:
@@ -665,12 +755,12 @@ def parse_asset(path: str | Path, max_wireframe_edges_per_mesh: int = 800) -> As
             )
         )
 
-    anims_raw = doc.get("animations", [])
+    anims_raw = [_as_dict(a) for a in _as_list(doc.get("animations"))]
     anim_names = _disambiguate_names(anims_raw, "animation")
     animations: list[AnimationSummary] = []
     for a_idx, anim_def in enumerate(anims_raw):
-        channels = anim_def.get("channels", [])
-        samplers = anim_def.get("samplers", [])
+        channels = [_as_dict(ch) for ch in _as_list(anim_def.get("channels"))]
+        samplers = [_as_dict(sp) for sp in _as_list(anim_def.get("samplers"))]
         target_paths = sorted(
             {
                 str(ch.get("target", {}).get("path"))
@@ -686,7 +776,7 @@ def parse_asset(path: str | Path, max_wireframe_edges_per_mesh: int = 800) -> As
                 acc_max = in_acc.get("max")
                 if isinstance(acc_max, list) and acc_max:
                     duration_sec = max(duration_sec, float(acc_max[0]))
-                elif in_acc.get("bufferView") is not None:
+                else:
                     ts = [float(v[0]) for v in _read_accessor(doc, buffers, in_idx)]
                     if ts:
                         duration_sec = max(duration_sec, max(ts))
