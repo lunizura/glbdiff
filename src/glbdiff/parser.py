@@ -5,7 +5,7 @@ import json
 import math
 import struct
 import urllib.parse
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Any
 
 from glbdiff.errors import GlbParseError
@@ -99,11 +99,17 @@ def _resolve_external_uri(base_dir: Path, uri: str) -> bytes:
     if parsed.scheme or uri.startswith("/") or uri.startswith("\\"):
         raise GlbParseError(f"Unsafe external buffer URI scheme or absolute path: {uri}")
     rel_uri = urllib.parse.unquote(uri)
+    rel_parsed = urllib.parse.urlsplit(rel_uri)
     rel_path = Path(rel_uri)
+    win_path = PureWindowsPath(rel_uri)
     if (
         not rel_uri.strip()
+        or "\x00" in rel_uri
+        or bool(rel_parsed.scheme)
         or rel_path.is_absolute()
+        or win_path.is_absolute()
         or bool(rel_path.drive)
+        or bool(win_path.drive)
         or rel_uri.startswith("/")
         or rel_uri.startswith("\\")
     ):
