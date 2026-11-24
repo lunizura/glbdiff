@@ -1,6 +1,6 @@
 # glbdiff
 
-[![CI](https://img.shields.io/badge/CI-Node%2024%20Actions-blue)](#github-actions-ci-budget-gate)
+[![CI](https://github.com/lunizura/glbdiff/actions/workflows/ci.yml/badge.svg)](https://github.com/lunizura/glbdiff/actions/workflows/ci.yml)
 [![Python](https://img.shields.io/badge/python-%3E%3D3.10-3776ab)](pyproject.toml)
 [![Dependencies](https://img.shields.io/badge/runtime%20dependencies-0-34d399)](pyproject.toml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)

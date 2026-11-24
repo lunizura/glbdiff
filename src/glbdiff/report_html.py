@@ -3,6 +3,7 @@ from __future__ import annotations
 import html
 import json
 import math
+from pathlib import Path
 from typing import Any
 
 from glbdiff.models import AssetSummary, DiffReport
@@ -105,6 +106,8 @@ def generate_html_diff(report: DiffReport) -> str:
 
     old_path_esc = html.escape(report.old_asset.path, quote=True)
     new_path_esc = html.escape(report.new_asset.path, quote=True)
+    old_name_esc = html.escape(Path(report.old_asset.path).name or report.old_asset.path, quote=True)
+    new_name_esc = html.escape(Path(report.new_asset.path).name or report.new_asset.path, quote=True)
 
     findings_rows = []
     for f in report.findings:
@@ -181,6 +184,11 @@ def generate_html_diff(report: DiffReport) -> str:
 
     before_json = _safe_script_json(before_scene)
     after_json = _safe_script_json(after_scene)
+    scale_ratio_json = (
+        _safe_script_json(_safe_float(report.scale_ratio))
+        if report.scale_ratio is not None
+        else "null"
+    )
 
     return f"""<!DOCTYPE html>
 <html lang="en">
@@ -293,6 +301,16 @@ def generate_html_diff(report: DiffReport) -> str:
     font-weight: 600;
     display: flex;
     justify-content: space-between;
+    align-items: center;
+    gap: 12px;
+  }}
+  .viewport-path {{
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    min-width: 0;
+    font-family: ui-monospace, monospace;
+    font-size: 0.8rem;
   }}
   canvas {{
     display: block;
@@ -363,6 +381,7 @@ def generate_html_diff(report: DiffReport) -> str:
     <div class="controls">
       <button id="btn-reset" type="button">Reset Camera</button>
       <button id="btn-toggle" type="button">Toggle Bones / AABB</button>
+      <button id="btn-scale-mode" type="button">Scale: Shared</button>
     </div>
     <div class="legend">
       <span><i class="dot" style="background:#38bdf8"></i>Unchanged</span>
@@ -376,11 +395,11 @@ def generate_html_diff(report: DiffReport) -> str:
 
   <section class="canvases">
     <div class="viewport">
-      <div class="viewport-head"><span>Before</span><span class="muted">{old_path_esc}</span></div>
+      <div class="viewport-head"><span>Before</span><span class="muted viewport-path" title="{old_path_esc}">{old_name_esc}</span></div>
       <canvas id="canvas-before"></canvas>
     </div>
     <div class="viewport">
-      <div class="viewport-head"><span>After</span><span class="muted">{new_path_esc}</span></div>
+      <div class="viewport-head"><span>After</span><span class="muted viewport-path" title="{new_path_esc}">{new_name_esc}</span></div>
       <canvas id="canvas-after"></canvas>
     </div>
   </section>
@@ -409,6 +428,7 @@ def generate_html_diff(report: DiffReport) -> str:
 <script>
 const BEFORE_SCENE = {before_json};
 const AFTER_SCENE = {after_json};
+const SCALE_RATIO = {scale_ratio_json};
 
 (function() {{
   const COLORS = {{
@@ -422,6 +442,7 @@ const AFTER_SCENE = {after_json};
 
   const cam = {{ yaw: 0.65, pitch: 0.35, zoom: 1.0 }};
   let showHelpers = true;
+  let fitEach = SCALE_RATIO !== null && (SCALE_RATIO >= 4.0 || SCALE_RATIO <= 0.25);
   let dragging = false;
   let lastX = 0;
   let lastY = 0;
@@ -467,12 +488,14 @@ const AFTER_SCENE = {after_json};
     return {{ center: [cx, cy, cz], radius }};
   }}
 
-  const bounds = computeSharedBounds([BEFORE_SCENE, AFTER_SCENE]);
+  const sharedBounds = computeSharedBounds([BEFORE_SCENE, AFTER_SCENE]);
+  const beforeBounds = computeSharedBounds([BEFORE_SCENE]);
+  const afterBounds = computeSharedBounds([AFTER_SCENE]);
 
-  function project(pt, w, h) {{
-    const cx = pt[0] - bounds.center[0];
-    const cy = pt[1] - bounds.center[1];
-    const cz = pt[2] - bounds.center[2];
+  function project(pt, w, h, b) {{
+    const cx = pt[0] - b.center[0];
+    const cy = pt[1] - b.center[1];
+    const cz = pt[2] - b.center[2];
 
     const cyaw = Math.cos(cam.yaw), syaw = Math.sin(cam.yaw);
     const cp = Math.cos(cam.pitch), sp = Math.sin(cam.pitch);
@@ -482,14 +505,14 @@ const AFTER_SCENE = {after_json};
     const y2 = cy * cp - z1 * sp;
     const z2 = cy * sp + z1 * cp;
 
-    const dist = bounds.radius * 3.2;
-    const denom = Math.max(dist - z2, bounds.radius * 0.5);
-    const scale = (Math.min(w, h) * 0.85 * cam.zoom) / (bounds.radius * 2.2);
+    const dist = b.radius * 3.2;
+    const denom = Math.max(dist - z2, b.radius * 0.5);
+    const scale = (Math.min(w, h) * 0.85 * cam.zoom) / (b.radius * 2.2);
     const persp = dist / denom;
     return [w * 0.5 + x1 * scale * persp, h * 0.5 - y2 * scale * persp];
   }}
 
-  function drawScene(canvas, scene) {{
+  function drawScene(canvas, scene, b) {{
     const dpr = window.devicePixelRatio || 1;
     const rect = canvas.getBoundingClientRect();
     const w = Math.max(rect.width, 100);
@@ -508,10 +531,10 @@ const AFTER_SCENE = {after_json};
       ctx.lineWidth = 1;
       ctx.beginPath();
       for (const [p0, p1] of aabbEdges(scene.world_aabb)) {{
-        const a = project(p0, w, h);
-        const b = project(p1, w, h);
+        const a = project(p0, w, h, b);
+        const ptB = project(p1, w, h, b);
         ctx.moveTo(a[0], a[1]);
-        ctx.lineTo(b[0], b[1]);
+        ctx.lineTo(ptB[0], ptB[1]);
       }}
       ctx.stroke();
     }}
@@ -521,10 +544,10 @@ const AFTER_SCENE = {after_json};
       ctx.lineWidth = 1.15;
       ctx.beginPath();
       for (const [p0, p1] of mesh.edges) {{
-        const a = project(p0, w, h);
-        const b = project(p1, w, h);
+        const a = project(p0, w, h, b);
+        const ptB = project(p1, w, h, b);
         ctx.moveTo(a[0], a[1]);
-        ctx.lineTo(b[0], b[1]);
+        ctx.lineTo(ptB[0], ptB[1]);
       }}
       ctx.stroke();
     }}
@@ -534,10 +557,10 @@ const AFTER_SCENE = {after_json};
       ctx.lineWidth = 2.0;
       ctx.beginPath();
       for (const [p0, p1] of scene.bones) {{
-        const a = project(p0, w, h);
-        const b = project(p1, w, h);
+        const a = project(p0, w, h, b);
+        const ptB = project(p1, w, h, b);
         ctx.moveTo(a[0], a[1]);
-        ctx.lineTo(b[0], b[1]);
+        ctx.lineTo(ptB[0], ptB[1]);
       }}
       ctx.stroke();
     }}
@@ -545,10 +568,15 @@ const AFTER_SCENE = {after_json};
 
   const cBefore = document.getElementById("canvas-before");
   const cAfter = document.getElementById("canvas-after");
+  const btnScale = document.getElementById("btn-scale-mode");
+
+  function syncScaleButton() {{
+    btnScale.textContent = fitEach ? "Scale: Fit Each" : "Scale: Shared";
+  }}
 
   function renderAll() {{
-    drawScene(cBefore, BEFORE_SCENE);
-    drawScene(cAfter, AFTER_SCENE);
+    drawScene(cBefore, BEFORE_SCENE, fitEach ? beforeBounds : sharedBounds);
+    drawScene(cAfter, AFTER_SCENE, fitEach ? afterBounds : sharedBounds);
   }}
 
   for (const c of [cBefore, cAfter]) {{
@@ -588,7 +616,13 @@ const AFTER_SCENE = {after_json};
     showHelpers = !showHelpers;
     renderAll();
   }});
+  btnScale.addEventListener("click", () => {{
+    fitEach = !fitEach;
+    syncScaleButton();
+    renderAll();
+  }});
   window.addEventListener("resize", renderAll);
+  syncScaleButton();
   renderAll();
 }})();
 </script>

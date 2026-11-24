@@ -203,6 +203,26 @@ def test_asset_optimized_info_and_policy_gates(tmp_path: Path) -> None:
     assert len(evaluate_policy(rep_brk, PolicyConfig(fail_on_breaking=True))) == 1
     assert evaluate_policy(rep_brk, PolicyConfig(fail_on_breaking=False)) == []
 
+    # Asset optimized should NOT fire if a budget spike warning also occurred
+    s_heavy_tex = parse_asset(
+        _make_base_hero(
+            tmp_path / "v1_bigtex.glb",
+            tri_count=10,
+            tex_bytes=make_png_bytes(64, 64) + b"\x00" * 4000,
+        )
+    )
+    s_smaller_file_but_tri_spike = parse_asset(
+        _make_base_hero(
+            tmp_path / "v2_spike.glb",
+            tri_count=20,  # +100% -> TRIANGLE_SPIKE
+            tex_bytes=make_png_bytes(64, 64),  # overall file size shrinks >5%
+        )
+    )
+    rep_mixed = diff_assets(s_heavy_tex, s_smaller_file_but_tri_spike)
+    mixed_codes = {f.code for f in rep_mixed.findings}
+    assert "TRIANGLE_SPIKE" in mixed_codes
+    assert "ASSET_OPTIMIZED" not in mixed_codes
+
     # Invalid threshold configs
     with pytest.raises(PolicyConfigError):
         PolicyConfig(max_tri_increase_pct=-1.0)

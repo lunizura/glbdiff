@@ -298,10 +298,13 @@ def diff_assets(old: AssetSummary, new: AssetSummary) -> DiffReport:
             )
         )
 
-    # 13: Asset optimized
+    # 13: Asset optimized (only when no breaking changes or budget spike warnings exist)
     size_pct = metrics["file_size_bytes"].pct_change
     has_breaking = any(f.severity == "BREAKING" for f in findings)
-    if not has_breaking and (
+    has_budget_spike = any(
+        f.code in ("TRIANGLE_SPIKE", "TEXTURE_MEMORY_SPIKE") for f in findings
+    )
+    if not has_breaking and not has_budget_spike and (
         (tri_pct is not None and tri_pct <= -5.0)
         or (size_pct is not None and size_pct <= -5.0)
     ):

@@ -99,6 +99,8 @@ def test_html_report_escaping_zero_cdn_and_wireframe_json(tmp_path: Path) -> Non
     # Dual canvases & controls present
     assert 'id="canvas-before"' in html_doc
     assert 'id="canvas-after"' in html_doc
+    assert 'id="btn-scale-mode"' in html_doc
+    assert "const SCALE_RATIO =" in html_doc
     assert "Reset Camera" in html_doc
     assert "Toggle Bones / AABB" in html_doc
 
